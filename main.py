@@ -6,41 +6,49 @@ import multiprocessing
 import os
 import sys
 import logging
-from config_read import port, ip_addr, sleep_wrtodb, sleep_for_sync,\
+from config_read import (
+    port, ip_addr, sleep_wrtodb, sleep_for_sync,
     password, login, post_url, get_url, ip_for_ping, limit_sql, auth_url
+)
 from pyModbusTCP.client import ModbusClient
 from datetime import datetime
 
-logging.basicConfig(level=logging.WARNING, filename='file.log',
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.WARNING,
+    filename='file.log',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 def sync_data():
     logger = logging.getLogger('sync_data')
+
     def ping_server(ip_address):
-        def ping(ip):
-            try:
-                result = subprocess.run(['ping', '-c', '1', ip], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if result.returncode == 0:
-                    return 1
-                else:
-                    return 0
-            except Exception as e:
-                logger.error(f"An error occurred during ping: {e}")
-                print(f"An error occurred: {e}")
-                return 0
-        return ping(ip_address)
+        """Проверяем доступность сервера по ping (Linux-команда `ping -c 1`)."""
+        try:
+            result = subprocess.run(
+                ['ping', '-c', '1', ip_address],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            return 1 if result.returncode == 0 else 0
+        except Exception as e:
+            logger.error(f"An error occurred during ping: {e}")
+            print(f"An error occurred: {e}")
+            return 0
 
     def get_unsynced_data(conn, max_id):
+        """Получаем записи, которые ещё не синхронизированы (id_event > max_id)."""
         cursor = conn.cursor()
         cursor.execute(f"""
-        SELECT id_event, datetimes, param1, param2
-        FROM your_table
-        WHERE your_table.id > {max_id}
-        LIMIT {limit_sql}
+            SELECT id_event, dateTime, param1, param2
+            FROM szm_telemetry
+            WHERE id_event > {max_id}
+            LIMIT {limit_sql}
         """)
         return cursor.fetchall()
 
     def authenticate(username, password):
+        """Получаем access-токен с помощью запроса на auth_url."""
         url = f"{auth_url}"
         headers = {"Content-Type": "application/json"}
         data = {"username": username, "password": password}
@@ -69,6 +77,7 @@ def sync_data():
         return None
 
     def get_max_id(access_token):
+        """Получаем последний id, который есть на сервере, чтобы синхронизировать дальше."""
         geturl = f'{get_url}'
         headers = {'Authorization': f'Bearer {access_token}'}
         params = []
@@ -83,6 +92,7 @@ def sync_data():
             return 0
 
     def send_data(data_batch, access_token):
+        """Отправляем порцию данных на сервер."""
         url = f'{post_url}'
         headers = {
             'Content-Type': 'application/json',
@@ -91,13 +101,16 @@ def sync_data():
         response = requests.post(url, json=data_batch, headers=headers, verify=False)
         return response.status_code
 
+    # Подключаемся к локальной базе
     conn = sqlite3.connect('telemetry.db')
+
     last_token_time = None
     access_token = None
-    time_token_expiring = 43080.0
+    time_token_expiring = 43080.0  # Примерное время жизни токена
+
     try:
         while True:
-            if ping_server(f'{ip_for_ping}') == 1:
+            if ping_server(ip_for_ping) == 1:
                 current_time = time.time()
                 if last_token_time is None or current_time - last_token_time > time_token_expiring:
                     access_token = authenticate(login, password)
@@ -118,30 +131,28 @@ def sync_data():
 
                 data_batch = []
                 for row in unsynced_data:
-                    id_event, datetimes, param1, param2,  = row
-
+                    id_event, dateTimeVal, param1, param2 = row
                     data = {
                         "id_event": id_event,
-                        "dateTime": datetimes,
+                        "dateTime": dateTimeVal,
                         "param1": param1,
                         "param2": param2,
                     }
-
                     data_batch.append(data)
 
-                if send_data(data_batch, access_token) == 200:
+                status_code = send_data(data_batch, access_token)
+                if status_code == 200:
                     print('data sent')
-                    data_batch.clear()
                 else:
                     print('error sending data')
-                    logger.error('Error sending data')
-                    data_batch.clear()
+                    logger.error(f'Error sending data, status_code = {status_code}')
 
             else:
                 logger.warning('Ping unsuccessful')
                 print('no ping')
 
             time.sleep(sleep_for_sync)
+
     except Exception as e:
         print(f'Dropped from while true: {e}')
         logger.error(f"An unexpected error occurred: {e}")
@@ -152,65 +163,65 @@ def modbus_tcp_client():
     logger = logging.getLogger('modbus_tcp_client')
 
     def insert_data_to_db(conn, data):
+        """
+        Записываем данные в локальную таблицу szm_telemetry.
+        Столбец id_event задаётся автоматически.
+        """
         insert_query = """
-            INSERT INTO your_table (id_event, datetime, param1, param2) 
-            VALUES (?, ?, ?, ?)
+            INSERT INTO szm_telemetry (dateTime, param1, param2)
+            VALUES (?, ?, ?)
         """
         conn.execute(insert_query, data)
         conn.commit()
+
+    # Создаём базу и таблицу, если не существует
+    create_database_and_table()
 
     if getattr(sys, 'frozen', False):
         base_path = os.path.dirname(sys.executable)
     else:
         base_path = os.path.abspath(".")
 
-    create_database_and_table()
-
     database_file = os.path.join(base_path, 'telemetry.db')
     conn = sqlite3.connect(database_file)
 
     client = ModbusClient(host=ip_addr, port=port, auto_open=True, auto_close=True)
+
     try:
         while True:
             registers = client.read_holding_registers(0, 2)
             if registers:
                 param1 = registers[0] * 1.0
                 param2 = registers[1] / 10.0
-
                 current_time = datetime.now().isoformat()
-
                 data = (current_time, param1, param2)
                 insert_data_to_db(conn, data)
                 print('recording in a local database')
-
                 time.sleep(sleep_wrtodb)
             else:
                 logger.error("Error reading registers from Modbus TCP")
-
     except Exception as e:
-        logger.error(f"Error before readinng registers while true : {e}")
+        logger.error(f"Error in modbus_tcp_client main loop: {e}")
     finally:
         client.close()
         conn.close()
 
 def create_database_and_table():
+    """
+    Создаёт таблицу szm_telemetry с нужной структурой, если она не существует.
+    """
     conn = sqlite3.connect('telemetry.db')
-
     cursor = conn.cursor()
-
     create_table_query = """
     CREATE TABLE IF NOT EXISTS szm_telemetry (
         id_event INTEGER PRIMARY KEY AUTOINCREMENT,
         dateTime DATETIME,
         param1 REAL,
-        param2 REAL,
+        param2 REAL
     )
     """
-
     cursor.execute(create_table_query)
-
     conn.commit()
-
     conn.close()
 
 def main():
